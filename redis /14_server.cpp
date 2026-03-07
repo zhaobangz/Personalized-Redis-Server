@@ -414,7 +414,9 @@ static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     } else if (ttl_ms >= 0) {
         // add or update the heap data structure
         uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
-        HeapItem item = {expire_at, &ent->heap_idx};
+        HeapItem item;
+        item.val = expire_at;
+        item.ref = &ent->heap_idx;
         heap_upsert(g_data.heap, ent->heap_idx, item);
     }
 }
