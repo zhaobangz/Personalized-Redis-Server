@@ -517,7 +517,7 @@ static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
     return out_int(out, (int64_t)added);
 }
 
-static const ZSet k_empty_zset;
+static ZSet k_empty_zset;  // sentinel for non-existent zset keys, never modified
 
 static ZSet *expect_zset(std::string &s) {
     LookupKey key;
@@ -525,7 +525,7 @@ static ZSet *expect_zset(std::string &s) {
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!hnode) {   // a non-existent key is treated as an empty zset
-        return (ZSet *)&k_empty_zset;
+        return &k_empty_zset;
     }
     Entry *ent = container_of(hnode, Entry, node);
     return ent->type == T_ZSET ? &ent->zset : NULL;
@@ -596,6 +596,130 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
     out_end_arr(out, ctx, (uint32_t)n);
 }
 
+// PING
+static void do_ping(std::vector<std::string> &, Buffer &out) {
+    return out_str(out, "PONG", 4);
+}
+
+// ECHO message
+static void do_echo(std::vector<std::string> &cmd, Buffer &out) {
+    return out_str(out, cmd[1].data(), cmd[1].size());
+}
+
+// EXISTS key
+static void do_exists(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    return out_int(out, node ? 1 : 0);
+}
+
+// INCR key
+static void do_incr(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        Entry *ent = entry_new(T_STR);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->str = "1";
+        hm_insert(&g_data.db, &ent->node);
+        return out_int(out, 1);
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+        return out_err(out, ERR_BAD_TYP, "not a string value");
+    }
+    int64_t val = 0;
+    if (!str2int(ent->str, val)) {
+        return out_err(out, ERR_BAD_ARG, "value is not an integer");
+    }
+    val++;
+    ent->str = std::to_string(val);
+    return out_int(out, val);
+}
+
+// DECR key
+static void do_decr(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        Entry *ent = entry_new(T_STR);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        ent->str = "-1";
+        hm_insert(&g_data.db, &ent->node);
+        return out_int(out, -1);
+    }
+    Entry *ent = container_of(node, Entry, node);
+    if (ent->type != T_STR) {
+        return out_err(out, ERR_BAD_TYP, "not a string value");
+    }
+    int64_t val = 0;
+    if (!str2int(ent->str, val)) {
+        return out_err(out, ERR_BAD_ARG, "value is not an integer");
+    }
+    val--;
+    ent->str = std::to_string(val);
+    return out_int(out, val);
+}
+
+// TYPE key
+static void do_type(std::vector<std::string> &cmd, Buffer &out) {
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
+    if (!node) {
+        return out_str(out, "none", 4);
+    }
+    Entry *ent = container_of(node, Entry, node);
+    switch (ent->type) {
+    case T_STR:
+        return out_str(out, "string", 6);
+    case T_ZSET:
+        return out_str(out, "zset", 4);
+    default:
+        return out_str(out, "none", 4);
+    }
+}
+
+// FLUSHDB
+static void do_flushdb(std::vector<std::string> &, Buffer &out) {
+    // free all entries in the newer table
+    for (size_t i = 0; g_data.db.newer.tab && i <= g_data.db.newer.mask; i++) {
+        for (HNode *node = g_data.db.newer.tab[i]; node; ) {
+            HNode *next = node->next;
+            Entry *ent = container_of(node, Entry, node);
+            if (ent->type == T_ZSET) {
+                zset_clear(&ent->zset);
+            }
+            delete ent;
+            node = next;
+        }
+    }
+    // free all entries in the older table
+    for (size_t i = 0; g_data.db.older.tab && i <= g_data.db.older.mask; i++) {
+        for (HNode *node = g_data.db.older.tab[i]; node; ) {
+            HNode *next = node->next;
+            Entry *ent = container_of(node, Entry, node);
+            if (ent->type == T_ZSET) {
+                zset_clear(&ent->zset);
+            }
+            delete ent;
+            node = next;
+        }
+    }
+    hm_clear(&g_data.db);
+    g_data.heap.clear();
+    return out_str(out, "OK", 2);
+}
+
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
@@ -617,6 +741,20 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "ping") {
+        return do_ping(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "echo") {
+        return do_echo(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "exists") {
+        return do_exists(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "incr") {
+        return do_incr(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "decr") {
+        return do_decr(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "type") {
+        return do_type(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "flushdb") {
+        return do_flushdb(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
