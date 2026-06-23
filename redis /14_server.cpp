@@ -11,12 +11,15 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <unistd.h>
+#include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/ip.h>
 // C++
 #include <string>
 #include <vector>
+#include <deque>
 // proj
 #include "common.h"
 #include "hashtable.h"
@@ -89,6 +92,85 @@ struct Conn {
     DList idle_node;
 };
 
+// ─── AOF (Append-Only File) persistence ────────────────────────────────
+static int g_aof_fd = -1;
+
+static void aof_open() {
+    g_aof_fd = open("server.aof", O_WRONLY | O_CREAT | O_APPEND, 0644);
+    if (g_aof_fd < 0) {
+        msg_errno("aof_open()");
+    }
+}
+
+static void aof_append(const uint8_t *data, size_t len) {
+    if (g_aof_fd < 0) return;
+    // Write [len:4][data] to match client protocol format
+    uint32_t len_u32 = (uint32_t)len;
+    (void)write(g_aof_fd, &len_u32, 4);
+    (void)write(g_aof_fd, data, len);
+}
+
+static void aof_close() {
+    if (g_aof_fd >= 0) {
+        fsync(g_aof_fd);
+        close(g_aof_fd);
+        g_aof_fd = -1;
+    }
+}
+
+// Forward declarations
+static void do_request(std::vector<std::string> &cmd, Buffer &out);
+static int32_t parse_req(const uint8_t *data, size_t size, std::vector<std::string> &out);
+
+// Replay AOF on startup
+static void aof_replay() {
+    int fd = open("server.aof", O_RDONLY);
+    if (fd < 0) return;
+    fprintf(stderr, "Replaying AOF log...\n");
+
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return; }
+
+    Buffer file_data(st.st_size);
+    size_t got = 0;
+    while (got < file_data.size()) {
+        ssize_t rv = read(fd, file_data.data() + got, file_data.size() - got);
+        if (rv <= 0) break;
+        got += (size_t)rv;
+    }
+    close(fd);
+
+    const uint8_t *cur = file_data.data();
+    const uint8_t *end = cur + got;
+    size_t replayed = 0;
+    while (cur + 4 <= end) {
+        uint32_t len = 0;
+        memcpy(&len, cur, 4);
+        cur += 4;
+        if (cur + len > end) break;
+        std::vector<std::string> cmd;
+        if (parse_req(cur, len, cmd) == 0) {
+            Buffer dummy;
+            do_request(cmd, dummy);
+            replayed++;
+        }
+        cur += len;
+    }
+    fprintf(stderr, "AOF replay: %zu commands replayed\n", replayed);
+
+    // Truncate and reopen for fresh append
+    aof_open();
+}
+
+// ─── Server statistics ──────────────────────────────────────────────────
+static struct {
+    uint64_t requests_processed = 0;
+    uint64_t keys_read = 0;
+    uint64_t keys_written = 0;
+    uint64_t start_time = 0;
+    uint64_t connections_received = 0;
+} g_stats;
+
 // global states
 static struct {
     HMap db;
@@ -100,6 +182,8 @@ static struct {
     std::vector<HeapItem> heap;
     // the thread pool
     TheadPool thread_pool;
+    // graceful shutdown
+    bool want_shutdown = false;
 } g_data;
 
 // application callback when the listening socket is ready
@@ -117,6 +201,7 @@ static int32_t handle_accept(int fd) {
         ip & 255, (ip >> 8) & 255, (ip >> 16) & 255, ip >> 24,
         ntohs(client_addr.sin_port)
     );
+    g_stats.connections_received++;
 
     // set the new connection fd to nonblocking mode
     fd_set_nb(connfd);
@@ -270,7 +355,22 @@ enum {
     T_INIT  = 0,
     T_STR   = 1,    // string
     T_ZSET  = 2,    // sorted set
+    T_LIST  = 3,    // list
+    T_HASH  = 4,    // hash
 };
+
+// ─── Hash type helpers ──────────────────────────────────────────────────
+struct HashNode {
+    struct HNode hnode;
+    std::string hkey;
+    std::string hval;
+};
+
+static bool hashnode_eq(HNode *a, HNode *b) {
+    HashNode *ha = container_of(a, HashNode, hnode);
+    HashNode *hb = container_of(b, HashNode, hnode);
+    return ha->hkey == hb->hkey;
+}
 
 // KV pair for the top-level hashtable
 struct Entry {
@@ -281,8 +381,10 @@ struct Entry {
     // value
     uint32_t type = 0;
     // one of the following
-    std::string str;
-    ZSet zset;
+    std::string str;                // T_STR
+    ZSet zset;                      // T_ZSET
+    std::deque<std::string> list;   // T_LIST
+    HMap hmap;                      // T_HASH
 };
 
 static Entry *entry_new(uint32_t type) {
@@ -294,8 +396,14 @@ static Entry *entry_new(uint32_t type) {
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms);
 
 static void entry_del_sync(Entry *ent) {
-    if (ent->type == T_ZSET) {
+    switch (ent->type) {
+    case T_ZSET:
         zset_clear(&ent->zset);
+        break;
+    case T_HASH:
+        hm_clear(&ent->hmap);
+        break;
+    // T_STR and T_LIST auto-destruct
     }
     delete ent;
 }
@@ -308,7 +416,9 @@ static void entry_del(Entry *ent) {
     // unlink it from any data structures
     entry_set_ttl(ent, -1); // remove from the heap data structure
     // run the destructor in a thread pool for large data structures
-    size_t set_size = (ent->type == T_ZSET) ? hm_size(&ent->zset.hmap) : 0;
+    size_t set_size = 0;
+    if (ent->type == T_ZSET) set_size = hm_size(&ent->zset.hmap);
+    if (ent->type == T_HASH) set_size = hm_size(&ent->hmap);
     const size_t k_large_container_size = 1000;
     if (set_size > k_large_container_size) {
         thread_pool_queue(&g_data.thread_pool, &entry_del_func, ent);
@@ -322,24 +432,34 @@ struct LookupKey {
     std::string key;
 };
 
-// equality comparison for the top-level hashstable
+// equality comparison for the top-level hashtable
 static bool entry_eq(HNode *node, HNode *key) {
     struct Entry *ent = container_of(node, struct Entry, node);
     struct LookupKey *keydata = container_of(key, struct LookupKey, node);
     return ent->key == keydata->key;
 }
 
+// ─── Helper: determine if a command is a write operation (for AOF) ──────
+static bool is_write_cmd(const std::vector<std::string> &cmd) {
+    if (cmd.empty()) return false;
+    const std::string &c = cmd[0];
+    return c == "set" || c == "del" || c == "pexpire" ||
+           c == "zadd" || c == "zrem" ||
+           c == "lpush" || c == "rpush" || c == "lpop" || c == "rpop" ||
+           c == "hset" || c == "hdel" ||
+           c == "incr" || c == "decr" ||
+           c == "flushdb";
+}
+
 static void do_get(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy struct just for the lookup
+    g_stats.keys_read++;
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    // hashtable lookup
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (!node) {
         return out_nil(out);
     }
-    // copy the value
     Entry *ent = container_of(node, Entry, node);
     if (ent->type != T_STR) {
         return out_err(out, ERR_BAD_TYP, "not a string value");
@@ -348,21 +468,18 @@ static void do_get(std::vector<std::string> &cmd, Buffer &out) {
 }
 
 static void do_set(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy struct just for the lookup
+    g_stats.keys_written++;
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    // hashtable lookup
     HNode *node = hm_lookup(&g_data.db, &key.node, &entry_eq);
     if (node) {
-        // found, update the value
         Entry *ent = container_of(node, Entry, node);
         if (ent->type != T_STR) {
             return out_err(out, ERR_BAD_TYP, "a non-string value exists");
         }
         ent->str.swap(cmd[2]);
     } else {
-        // not found, allocate & insert a new pair
         Entry *ent = entry_new(T_STR);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
@@ -373,23 +490,20 @@ static void do_set(std::vector<std::string> &cmd, Buffer &out) {
 }
 
 static void do_del(std::vector<std::string> &cmd, Buffer &out) {
-    // a dummy struct just for the lookup
+    g_stats.keys_written++;
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
-    // hashtable delete
     HNode *node = hm_delete(&g_data.db, &key.node, &entry_eq);
-    if (node) { // deallocate the pair
+    if (node) {
         entry_del(container_of(node, Entry, node));
     }
     return out_int(out, node ? 1 : 0);
 }
 
 static void heap_delete(std::vector<HeapItem> &a, size_t pos) {
-    // swap the erased item with the last item
     a[pos] = a.back();
     a.pop_back();
-    // update the swapped item
     if (pos < a.size()) {
         heap_update(a.data(), pos, a.size());
     }
@@ -397,10 +511,10 @@ static void heap_delete(std::vector<HeapItem> &a, size_t pos) {
 
 static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t) {
     if (pos < a.size()) {
-        a[pos] = t;         // update an existing item
+        a[pos] = t;
     } else {
         pos = a.size();
-        a.push_back(t);     // or add a new item
+        a.push_back(t);
     }
     heap_update(a.data(), pos, a.size());
 }
@@ -408,11 +522,9 @@ static void heap_upsert(std::vector<HeapItem> &a, size_t pos, HeapItem t) {
 // set or remove the TTL
 static void entry_set_ttl(Entry *ent, int64_t ttl_ms) {
     if (ttl_ms < 0 && ent->heap_idx != (size_t)-1) {
-        // setting a negative TTL means removing the TTL
         heap_delete(g_data.heap, ent->heap_idx);
         ent->heap_idx = -1;
     } else if (ttl_ms >= 0) {
-        // add or update the heap data structure
         uint64_t expire_at = get_monotonic_msec() + (uint64_t)ttl_ms;
         HeapItem item;
         item.val = expire_at;
@@ -487,31 +599,30 @@ static bool str2dbl(const std::string &s, double &out) {
 
 // zadd zset score name
 static void do_zadd(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
     double score = 0;
     if (!str2dbl(cmd[2], score)) {
         return out_err(out, ERR_BAD_ARG, "expect float");
     }
 
-    // look up or create the zset
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
 
     Entry *ent = NULL;
-    if (!hnode) {   // insert a new key
+    if (!hnode) {
         ent = entry_new(T_ZSET);
         ent->key.swap(key.key);
         ent->node.hcode = key.node.hcode;
         hm_insert(&g_data.db, &ent->node);
-    } else {        // check the existing key
+    } else {
         ent = container_of(hnode, Entry, node);
         if (ent->type != T_ZSET) {
             return out_err(out, ERR_BAD_TYP, "expect zset");
         }
     }
 
-    // add or update the tuple
     const std::string &name = cmd[3];
     bool added = zset_insert(&ent->zset, name.data(), name.size(), score);
     return out_int(out, (int64_t)added);
@@ -524,7 +635,7 @@ static ZSet *expect_zset(std::string &s) {
     key.key.swap(s);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
     HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
-    if (!hnode) {   // a non-existent key is treated as an empty zset
+    if (!hnode) {
         return &k_empty_zset;
     }
     Entry *ent = container_of(hnode, Entry, node);
@@ -533,6 +644,7 @@ static ZSet *expect_zset(std::string &s) {
 
 // zrem zset name
 static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) {
         return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -548,6 +660,7 @@ static void do_zrem(std::vector<std::string> &cmd, Buffer &out) {
 
 // zscore zset name
 static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) {
         return out_err(out, ERR_BAD_TYP, "expect zset");
@@ -560,7 +673,7 @@ static void do_zscore(std::vector<std::string> &cmd, Buffer &out) {
 
 // zquery zset score name offset limit
 static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
-    // parse args
+    g_stats.keys_read++;
     double score = 0;
     if (!str2dbl(cmd[2], score)) {
         return out_err(out, ERR_BAD_ARG, "expect fp number");
@@ -571,20 +684,17 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
         return out_err(out, ERR_BAD_ARG, "expect int");
     }
 
-    // get the zset
     ZSet *zset = expect_zset(cmd[1]);
     if (!zset) {
         return out_err(out, ERR_BAD_TYP, "expect zset");
     }
 
-    // seek to the key
     if (limit <= 0) {
         return out_arr(out, 0);
     }
     ZNode *znode = zset_seekge(zset, score, name.data(), name.size());
     znode = znode_offset(znode, offset);
 
-    // output
     size_t ctx = out_begin_arr(out);
     int64_t n = 0;
     while (znode && n < limit) {
@@ -594,6 +704,346 @@ static void do_zquery(std::vector<std::string> &cmd, Buffer &out) {
         n += 2;
     }
     out_end_arr(out, ctx, (uint32_t)n);
+}
+
+// ─── List commands ──────────────────────────────────────────────────────
+
+// LPUSH key value
+static void do_lpush(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_LIST);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_LIST) {
+            return out_err(out, ERR_BAD_TYP, "expect list");
+        }
+    }
+    ent->list.push_front(cmd[2]);
+    return out_int(out, (int64_t)ent->list.size());
+}
+
+// RPUSH key value
+static void do_rpush(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_LIST);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_LIST) {
+            return out_err(out, ERR_BAD_TYP, "expect list");
+        }
+    }
+    ent->list.push_back(cmd[2]);
+    return out_int(out, (int64_t)ent->list.size());
+}
+
+// LPOP key
+static void do_lpop(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_nil(out);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) {
+        return out_err(out, ERR_BAD_TYP, "expect list");
+    }
+    if (ent->list.empty()) {
+        return out_nil(out);
+    }
+    std::string val = ent->list.front();
+    ent->list.pop_front();
+    return out_str(out, val.data(), val.size());
+}
+
+// RPOP key
+static void do_rpop(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_nil(out);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) {
+        return out_err(out, ERR_BAD_TYP, "expect list");
+    }
+    if (ent->list.empty()) {
+        return out_nil(out);
+    }
+    std::string val = ent->list.back();
+    ent->list.pop_back();
+    return out_str(out, val.data(), val.size());
+}
+
+// LLEN key
+static void do_llen(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_int(out, 0);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) {
+        return out_err(out, ERR_BAD_TYP, "expect list");
+    }
+    return out_int(out, (int64_t)ent->list.size());
+}
+
+// LRANGE key start stop
+static void do_lrange(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_arr(out, 0);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_LIST) {
+        return out_err(out, ERR_BAD_TYP, "expect list");
+    }
+
+    int64_t start = 0, stop = 0;
+    if (!str2int(cmd[2], start) || !str2int(cmd[3], stop)) {
+        return out_err(out, ERR_BAD_ARG, "expect int");
+    }
+
+    int64_t len = (int64_t)ent->list.size();
+    // Normalize negative indices
+    if (start < 0) start = len + start;
+    if (stop  < 0) stop  = len + stop;
+    if (start < 0) start = 0;
+    if (stop  < 0) stop  = 0;
+    if (start >= len || stop < start) {
+        return out_arr(out, 0);
+    }
+    if (stop >= len) stop = len - 1;
+
+    size_t ctx = out_begin_arr(out);
+    uint32_t n = 0;
+    for (int64_t i = start; i <= stop && i < len; i++) {
+        out_str(out, ent->list[(size_t)i].data(), ent->list[(size_t)i].size());
+        n++;
+    }
+    out_end_arr(out, ctx, n);
+}
+
+// ─── Hash commands ──────────────────────────────────────────────────────
+
+// HSET hash key value
+static void do_hset(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    Entry *ent = NULL;
+    if (!hnode) {
+        ent = entry_new(T_HASH);
+        ent->key.swap(key.key);
+        ent->node.hcode = key.node.hcode;
+        hm_insert(&g_data.db, &ent->node);
+    } else {
+        ent = container_of(hnode, Entry, node);
+        if (ent->type != T_HASH) {
+            return out_err(out, ERR_BAD_TYP, "expect hash");
+        }
+    }
+
+    // Look up the field in the hash's internal HMap
+    HashNode hkey;
+    hkey.hnode.hcode = str_hash((uint8_t *)cmd[2].data(), cmd[2].size());
+    hkey.hkey = cmd[2];
+
+    HNode *found = hm_lookup(&ent->hmap, &hkey.hnode, &hashnode_eq);
+    bool is_new = (found == NULL);
+    if (found) {
+        container_of(found, HashNode, hnode)->hval = cmd[3];
+    } else {
+        HashNode *node = new HashNode();
+        node->hnode.hcode = str_hash((uint8_t *)cmd[2].data(), cmd[2].size());
+        node->hkey = cmd[2];
+        node->hval = cmd[3];
+        hm_insert(&ent->hmap, &node->hnode);
+    }
+    return out_int(out, is_new ? 1 : 0);
+}
+
+// HGET hash key
+static void do_hget(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_nil(out);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) {
+        return out_err(out, ERR_BAD_TYP, "expect hash");
+    }
+
+    HashNode hkey;
+    hkey.hnode.hcode = str_hash((uint8_t *)cmd[2].data(), cmd[2].size());
+    hkey.hkey = cmd[2];
+
+    HNode *found = hm_lookup(&ent->hmap, &hkey.hnode, &hashnode_eq);
+    if (!found) {
+        return out_nil(out);
+    }
+    HashNode *hfound = container_of(found, HashNode, hnode);
+    return out_str(out, hfound->hval.data(), hfound->hval.size());
+}
+
+// HDEL hash key
+static void do_hdel(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_int(out, 0);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) {
+        return out_err(out, ERR_BAD_TYP, "expect hash");
+    }
+
+    HashNode hkey;
+    hkey.hnode.hcode = str_hash((uint8_t *)cmd[2].data(), cmd[2].size());
+    hkey.hkey = cmd[2];
+
+    HNode *found = hm_delete(&ent->hmap, &hkey.hnode, &hashnode_eq);
+    if (found) {
+        delete container_of(found, HashNode, hnode);
+        return out_int(out, 1);
+    }
+    return out_int(out, 0);
+}
+
+// HGETALL hash
+static void do_hgetall(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_arr(out, 0);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) {
+        return out_err(out, ERR_BAD_TYP, "expect hash");
+    }
+
+    // Collect all field-value pairs
+    size_t field_count = hm_size(&ent->hmap);
+    size_t ctx = out_begin_arr(out);
+    uint32_t n = 0;
+
+    // Iterate both tables
+    auto collect = [](HNode *node, void *arg) -> bool {
+        Buffer &b = *(Buffer *)arg;
+        HashNode *hn = container_of(node, HashNode, hnode);
+        out_str(b, hn->hkey.data(), hn->hkey.size());
+        out_str(b, hn->hval.data(), hn->hval.size());
+        return true;
+    };
+    hm_foreach(&ent->hmap, collect, &out);
+
+    out_end_arr(out, ctx, (uint32_t)(field_count * 2));
+}
+
+// HEXISTS hash key
+static void do_hexists(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_read++;
+    LookupKey key;
+    key.key.swap(cmd[1]);
+    key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
+    HNode *hnode = hm_lookup(&g_data.db, &key.node, &entry_eq);
+
+    if (!hnode) {
+        return out_int(out, 0);
+    }
+    Entry *ent = container_of(hnode, Entry, node);
+    if (ent->type != T_HASH) {
+        return out_err(out, ERR_BAD_TYP, "expect hash");
+    }
+
+    HashNode hkey;
+    hkey.hnode.hcode = str_hash((uint8_t *)cmd[2].data(), cmd[2].size());
+    hkey.hkey = cmd[2];
+
+    HNode *found = hm_lookup(&ent->hmap, &hkey.hnode, &hashnode_eq);
+    return out_int(out, found ? 1 : 0);
+}
+
+// ─── INFO command ────────────────────────────────────────────────────────
+static void do_info(std::vector<std::string> &, Buffer &out) {
+    uint64_t uptime = get_monotonic_msec() - g_stats.start_time;
+    char buf[512];
+    int len = snprintf(buf, sizeof(buf),
+        "# Server\n"
+        "uptime_ms:%llu\n"
+        "version:1.0.0\n"
+        "# Stats\n"
+        "requests_processed:%llu\n"
+        "keys_read:%llu\n"
+        "keys_written:%llu\n"
+        "connections_received:%llu\n"
+        "total_keys:%zu\n"
+        "# Memory\n"
+        "total_connections:%zu\n",
+        (unsigned long long)uptime,
+        (unsigned long long)g_stats.requests_processed,
+        (unsigned long long)g_stats.keys_read,
+        (unsigned long long)g_stats.keys_written,
+        (unsigned long long)g_stats.connections_received,
+        hm_size(&g_data.db),
+        g_data.fd2conn.size()
+    );
+    return out_str(out, buf, (size_t)len);
 }
 
 // PING
@@ -617,6 +1067,7 @@ static void do_exists(std::vector<std::string> &cmd, Buffer &out) {
 
 // INCR key
 static void do_incr(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -644,6 +1095,7 @@ static void do_incr(std::vector<std::string> &cmd, Buffer &out) {
 
 // DECR key
 static void do_decr(std::vector<std::string> &cmd, Buffer &out) {
+    g_stats.keys_written++;
     LookupKey key;
     key.key.swap(cmd[1]);
     key.node.hcode = str_hash((uint8_t *)key.key.data(), key.key.size());
@@ -680,38 +1132,30 @@ static void do_type(std::vector<std::string> &cmd, Buffer &out) {
     }
     Entry *ent = container_of(node, Entry, node);
     switch (ent->type) {
-    case T_STR:
-        return out_str(out, "string", 6);
-    case T_ZSET:
-        return out_str(out, "zset", 4);
-    default:
-        return out_str(out, "none", 4);
+    case T_STR:  return out_str(out, "string", 6);
+    case T_ZSET: return out_str(out, "zset", 4);
+    case T_LIST: return out_str(out, "list", 4);
+    case T_HASH: return out_str(out, "hash", 4);
+    default:     return out_str(out, "none", 4);
     }
 }
 
 // FLUSHDB
 static void do_flushdb(std::vector<std::string> &, Buffer &out) {
-    // free all entries in the newer table
+    g_stats.keys_written++;
     for (size_t i = 0; g_data.db.newer.tab && i <= g_data.db.newer.mask; i++) {
         for (HNode *node = g_data.db.newer.tab[i]; node; ) {
             HNode *next = node->next;
             Entry *ent = container_of(node, Entry, node);
-            if (ent->type == T_ZSET) {
-                zset_clear(&ent->zset);
-            }
-            delete ent;
+            entry_del_sync(ent);
             node = next;
         }
     }
-    // free all entries in the older table
     for (size_t i = 0; g_data.db.older.tab && i <= g_data.db.older.mask; i++) {
         for (HNode *node = g_data.db.older.tab[i]; node; ) {
             HNode *next = node->next;
             Entry *ent = container_of(node, Entry, node);
-            if (ent->type == T_ZSET) {
-                zset_clear(&ent->zset);
-            }
-            delete ent;
+            entry_del_sync(ent);
             node = next;
         }
     }
@@ -720,6 +1164,7 @@ static void do_flushdb(std::vector<std::string> &, Buffer &out) {
     return out_str(out, "OK", 2);
 }
 
+// ─── Command dispatch ────────────────────────────────────────────────────
 static void do_request(std::vector<std::string> &cmd, Buffer &out) {
     if (cmd.size() == 2 && cmd[0] == "get") {
         return do_get(cmd, out);
@@ -741,6 +1186,28 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_zscore(cmd, out);
     } else if (cmd.size() == 6 && cmd[0] == "zquery") {
         return do_zquery(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "lpush") {
+        return do_lpush(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "rpush") {
+        return do_rpush(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "lpop") {
+        return do_lpop(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "rpop") {
+        return do_rpop(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "llen") {
+        return do_llen(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "lrange") {
+        return do_lrange(cmd, out);
+    } else if (cmd.size() == 4 && cmd[0] == "hset") {
+        return do_hset(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "hget") {
+        return do_hget(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "hdel") {
+        return do_hdel(cmd, out);
+    } else if (cmd.size() == 2 && cmd[0] == "hgetall") {
+        return do_hgetall(cmd, out);
+    } else if (cmd.size() == 3 && cmd[0] == "hexists") {
+        return do_hexists(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "ping") {
         return do_ping(cmd, out);
     } else if (cmd.size() == 2 && cmd[0] == "echo") {
@@ -755,6 +1222,8 @@ static void do_request(std::vector<std::string> &cmd, Buffer &out) {
         return do_type(cmd, out);
     } else if (cmd.size() == 1 && cmd[0] == "flushdb") {
         return do_flushdb(cmd, out);
+    } else if (cmd.size() == 1 && cmd[0] == "info") {
+        return do_info(cmd, out);
     } else {
         return out_err(out, ERR_UNKNOWN, "unknown command.");
     }
@@ -805,14 +1274,21 @@ static bool try_one_request(Conn *conn) {
         conn->want_close = true;
         return false;   // want close
     }
+
+    // AOF: log write commands before processing
+    if (is_write_cmd(cmd)) {
+        aof_append(request, len);
+    }
+
     size_t header_pos = 0;
     response_begin(conn->outgoing, &header_pos);
     do_request(cmd, conn->outgoing);
     response_end(conn->outgoing, header_pos);
 
+    g_stats.requests_processed++;
+
     // application logic done! remove the request message.
     buf_consume(conn->incoming, 4 + len);
-    // Q: Why not just empty the buffer? See the explanation of "pipelining".
     return true;        // success
 }
 
@@ -868,7 +1344,6 @@ static void handle_read(Conn *conn) {
 
     // parse requests and generate responses
     while (try_one_request(conn)) {}
-    // Q: Why calling this in a loop? See the explanation of "pipelining".
 
     // update the readiness intention
     if (conn->outgoing.size() > 0) {    // has a response
@@ -929,20 +1404,39 @@ static void process_timers() {
         Entry *ent = container_of(heap[0].ref, Entry, heap_idx);
         HNode *node = hm_delete(&g_data.db, &ent->node, &hnode_same);
         assert(node == &ent->node);
-        // fprintf(stderr, "key expired: %s\n", ent->key.c_str());
-        // delete the key
         entry_del(ent);
         if (nworks++ >= k_max_works) {
-            // don't stall the server if too many keys are expiring at once
             break;
         }
     }
 }
 
+// ─── Graceful shutdown ──────────────────────────────────────────────────
+static void shutdown_server() {
+    fprintf(stderr, "\nShutting down gracefully...\n");
+    g_data.want_shutdown = true;
+}
+
+static void sig_handler(int signo) {
+    (void)signo;
+    shutdown_server();
+}
+
 int main() {
+    // signal handling
+    signal(SIGINT, sig_handler);
+    signal(SIGTERM, sig_handler);
+    signal(SIGPIPE, SIG_IGN);  // ignore broken pipe
+
     // initialization
+    g_stats.start_time = get_monotonic_msec();
     dlist_init(&g_data.idle_list);
     thread_pool_init(&g_data.thread_pool, 4);
+
+    // replay AOF to recover state
+    aof_replay();
+    // open AOF for new writes
+    aof_open();
 
     // the listening socket
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -971,9 +1465,11 @@ int main() {
         die("listen()");
     }
 
+    fprintf(stderr, "Server listening on port 1234\n");
+
     // the event loop
     std::vector<struct pollfd> poll_args;
-    while (true) {
+    while (!g_data.want_shutdown) {
         // prepare the arguments of the poll()
         poll_args.clear();
         // put the listening sockets in the first position
@@ -996,11 +1492,12 @@ int main() {
             poll_args.push_back(pfd);
         }
 
-        // wait for readiness
+        // wait for readiness (reduced timeout to check shutdown flag)
         int32_t timeout_ms = next_timer_ms();
+        if (timeout_ms > 100 || timeout_ms < 0) timeout_ms = 100; // check shutdown every 100ms
         int rv = poll(poll_args.data(), (nfds_t)poll_args.size(), timeout_ms);
         if (rv < 0 && errno == EINTR) {
-            continue;   // not an error
+            continue;   // signal interrupted, check shutdown flag
         }
         if (rv < 0) {
             die("poll");
@@ -1012,12 +1509,13 @@ int main() {
         }
 
         // handle connection sockets
-        for (size_t i = 1; i < poll_args.size(); ++i) { // note: skip the 1st
+        for (size_t i = 1; i < poll_args.size(); ++i) {
             uint32_t ready = poll_args[i].revents;
             if (ready == 0) {
                 continue;
             }
             Conn *conn = g_data.fd2conn[poll_args[i].fd];
+            if (!conn) continue;
 
             // update the idle timer by moving conn to the end of the list
             conn->last_active_ms = get_monotonic_msec();
@@ -1027,21 +1525,29 @@ int main() {
             // handle IO
             if (ready & POLLIN) {
                 assert(conn->want_read);
-                handle_read(conn);  // application logic
+                handle_read(conn);
             }
             if (ready & POLLOUT) {
                 assert(conn->want_write);
-                handle_write(conn); // application logic
+                handle_write(conn);
             }
 
             // close the socket from socket error or application logic
             if ((ready & POLLERR) || conn->want_close) {
                 conn_destroy(conn);
             }
-        }   // for each connection sockets
+        }
 
         // handle timers
         process_timers();
-    }   // the event loop
+    }
+
+    // ─── Shutdown: close AOF, clean up ────────────────────────────────
+    fprintf(stderr, "Closing AOF log...\n");
+    aof_close();
+
+    fprintf(stderr, "Server shut down. Stats: %llu requests, %zu keys\n",
+            (unsigned long long)g_stats.requests_processed,
+            hm_size(&g_data.db));
     return 0;
 }

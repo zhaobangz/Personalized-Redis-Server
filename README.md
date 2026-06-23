@@ -1,225 +1,223 @@
 # Redis-like Server Implementation
 
-This project is a custom C++ implementation of a Redis-like in-memory key-value store, designed as a high-performance database, cache, and message broker. It stores data in the server's main memory (RAM) rather than on disk, enabling extremely fast read and write operations with sub-millisecond latency.
+A custom C++ implementation of an in-memory key-value store inspired by Redis. Built from scratch with custom data structures — no external dependencies beyond the C++ standard library and POSIX APIs.
 
 ## Features
 
-- **In-memory storage**: All data is stored in RAM for maximum speed
-- **Key-value operations**: GET, SET, DEL, EXISTS, KEYS
-- **Numeric operations**: INCR, DECR
-- **Type introspection**: TYPE
-- **Utility commands**: PING, ECHO, FLUSHDB
-- **TTL (Time To Live)**: Automatic expiration of keys with PEXPIRE and PTTL
-- **Sorted Sets (ZSET)**: Ordered collections with scores, supporting ZADD, ZREM, ZSCORE, ZQUERY
-- **Thread pool**: Multi-threaded request handling for better performance
-- **Custom binary protocol**: Efficient serialization for client-server communication
-- **Connection management**: Idle timeout and connection pooling
-- **Data structures**: Custom implementations of AVL trees, hashtables, heaps, and doubly-linked lists
+### Data Types
+- **Strings**: GET, SET, DEL, EXISTS, INCR, DECR
+- **Lists**: LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE (with negative index support)
+- **Hashes**: HSET, HGET, HDEL, HGETALL, HEXISTS
+- **Sorted Sets**: ZADD, ZREM, ZSCORE, ZQUERY (with pagination, offset, limit)
+- **TTL**: PEXPIRE, PTTL with automatic key expiration via min-heap
 
-## Architecture
+### Persistence
+- **AOF (Append-Only File)**: All write commands are logged to `server.aof`
+- **Crash recovery**: On startup, AOF log is replayed to restore state
+- **Graceful shutdown**: SIGTERM/SIGINT triggers clean shutdown with AOF fsync
 
-The server is built using several custom data structures and components:
+### Server Features
+- **Event-driven I/O**: `poll()`-based event loop with non-blocking sockets
+- **Request pipelining**: Multiple requests per connection
+- **Thread pool**: Asynchronous deletion of large data structures
+- **Connection management**: Idle timeout (5s), connection pooling
+- **Statistics**: INFO command with uptime, request count, key count, connections
+- **Binary protocol**: Efficient tagged serialization (NIL, ERR, STR, INT, DBL, ARR)
 
-### Core Components
-- **Server (14_server.cpp)**: Main server loop handling connections, requests, and responses
-- **Data Structures**:
-  - `hashtable.cpp/h`: Hash table with progressive rehashing
-  - `zset.cpp/h`: Sorted sets using AVL trees and hash tables
-  - `avl.cpp/h`: Self-balancing AVL tree implementation
-  - `heap.cpp/h`: Min-heap for TTL management
-  - `list.h`: Doubly-linked list utilities
-  - `thread_pool.cpp/h`: Thread pool for asynchronous operations
-- **Common utilities (common.h)**: Hash functions and container macros (container_of)
+### Custom Data Structures
+- **AVL Tree** (`avl.cpp/h`): Self-balancing binary search tree with rank queries
+- **Hash Table** (`hashtable.cpp/h`): Progressive rehashing with load-factor triggering
+- **Min-Heap** (`heap.cpp/h`): TTL expiration tracking
+- **Intrusive Doubly-Linked List** (`list.h`): Connection idle timer management
+- **Thread Pool** (`thread_pool.cpp/h`): Background deletion of large containers
 
-### Key Features
-- **Event-driven I/O**: Uses `poll()` for efficient socket handling
-- **Non-blocking sockets**: All connections are set to non-blocking mode
-- **Request pipelining**: Supports multiple requests per connection
-- **TTL management**: Uses a heap to efficiently track and expire keys
-- **Thread pool**: Handles large data structure deletions asynchronously
+## Quick Start
 
-## Build Instructions
-
-### Prerequisites
-- C++11 compatible compiler (g++ or Clang)
-- POSIX-compliant system (Linux/macOS)
-- pthread library
-
-### Quick Build
+### Build
 ```bash
 cd "redis "
 make
 ```
 
-This builds both the server (`server`) and the test client (`test_client`).
+### Run Server
+```bash
+./redis /server
+# Server listening on port 1234
+```
 
-### Manual Compilation
+### Run Tests
 ```bash
 cd "redis "
-g++ -std=c++11 -pthread *.cpp -o server
-g++ -std=c++11 -pthread test_client.cpp -o test_client
-```
-
-## Usage
-
-### Starting the Server
-```bash
-./redis /server
-```
-The server listens on port 1234 (0.0.0.0).
-
-### Running Tests
-```bash
 make test
 ```
-Or manually:
-```bash
-# Terminal 1
-./redis /server
-
-# Terminal 2
-./redis /test_client
-```
-
-### Connecting to the Server
-You can connect using any TCP client, but you'll need to use the custom binary protocol. Use the provided `test_client` as a reference implementation or connect with:
-- **telnet** (though it won't handle binary data well)
-- **netcat (nc)**: `nc localhost 1234`
-
-### Protocol Overview
-The server uses a custom binary protocol:
-
-1. **Message Format**: `[4-byte length][payload]`
-2. **Request**: Array of strings: `[nstr:4][len1:4][str1][len2:4][str2]...`
-3. **Response**: Tagged data types (NIL, ERR, STR, INT, DBL, ARR)
-
-All integers are 4-byte little-endian (`uint32_t`), with INT64 and DBL using 8 bytes.
-
-### Supported Commands
-
-#### Basic Key-Value Operations
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| GET | `GET <key>` | Retrieve the value of a key (returns nil if not found) |
-| SET | `SET <key> <value>` | Set the value of a key |
-| DEL | `DEL <key>` | Delete a key (returns 1 if deleted, 0 if not found) |
-| EXISTS | `EXISTS <key>` | Check if a key exists (returns 1 or 0) |
-| KEYS | `KEYS` | List all keys (returns array of strings) |
-| TYPE | `TYPE <key>` | Get the type of a key ("string", "zset", or "none") |
-
-#### Numeric Operations
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| INCR | `INCR <key>` | Increment integer value by 1 (creates key with value 1 if absent) |
-| DECR | `DECR <key>` | Decrement integer value by 1 (creates key with value -1 if absent) |
-
-#### TTL Operations
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| PEXPIRE | `PEXPIRE <key> <ttl_ms>` | Set expiration time in milliseconds (returns 1 or 0) |
-| PTTL | `PTTL <key>` | Get remaining TTL in ms (-1: no TTL, -2: key not found) |
-
-#### Sorted Set Operations
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| ZADD | `ZADD <zset> <score> <name>` | Add member to sorted set (returns 1 for new, 0 for update) |
-| ZREM | `ZREM <zset> <name>` | Remove member from sorted set (returns 1 or 0) |
-| ZSCORE | `ZSCORE <zset> <name>` | Get score of a member (returns double or nil) |
-| ZQUERY | `ZQUERY <zset> <score> <name> <offset> <limit>` | Query members with pagination (returns flat array of name/score pairs) |
-
-#### Server Commands
-| Command | Syntax | Description |
-|---------|--------|-------------|
-| PING | `PING` | Returns "PONG" |
-| ECHO | `ECHO <message>` | Returns the message back |
-| FLUSHDB | `FLUSHDB` | Delete all keys and clear all data structures |
-
-### Protocol Data Types (Response Tags)
-
-| Tag | Value | Description |
-|-----|-------|-------------|
-| NIL | 0 | Null/nil value (1 byte) |
-| ERR | 1 | Error: [code:4][len:4][msg:...] |
-| STR | 2 | String: [len:4][data:...] |
-| INT | 3 | 64-bit signed integer (8 bytes) |
-| DBL | 4 | 64-bit double (8 bytes) |
-| ARR | 5 | Array: [count:4][items...] |
-
-### Error Codes
-
-| Code | Name | Description |
-|------|------|-------------|
-| 1 | ERR_UNKNOWN | Unknown command |
-| 2 | ERR_TOO_BIG | Response too big |
-| 3 | ERR_BAD_TYP | Unexpected value type |
-| 4 | ERR_BAD_ARG | Bad argument |
-
-## Test Suite
-
-The project includes a comprehensive test client (`test_client.cpp`) that tests all server functionality:
-
-### Test Coverage (50 tests)
-- **Basic commands** (3 tests): PING, ECHO, ECHO empty string
-- **Key-value operations** (12 tests): SET/GET, DEL, EXISTS, TYPE, KEYS
-- **Numeric operations** (6 tests): INCR, DECR, error handling
-- **TTL operations** (6 tests): PEXPIRE, PTTL, TTL expiration
-- **Sorted set operations** (14 tests): ZADD, ZSCORE, ZREM, ZQUERY with pagination/offset/limit, type errors
-- **Database operations** (3 tests): FLUSHDB, data clearing
-- **Error handling** (2 tests): Unknown commands, argument validation
-- **Advanced cases** (4 tests): Large values (10KB), binary data with null bytes, empty keys/values
-
-```bash
-make test
-```
-
-Expected output:
+Output:
 ```
 ╔══════════════════════════════════════════════════════╗
 ║   Redis-like Server — Comprehensive Test Suite      ║
 ╚══════════════════════════════════════════════════════╝
 ...
-║  RESULTS:  50 total,  50 passed,   0 failed       ║
+║  RESULTS:  82 total,  82 passed,   0 failed       ║
 ║         ✓ ALL TESTS PASSED!                        ║
 ╚══════════════════════════════════════════════════════╝
+```
+
+### Manual Compilation
+```bash
+g++ -std=c++11 -pthread 14_server.cpp avl.cpp hashtable.cpp heap.cpp zset.cpp thread_pool.cpp -o server
+g++ -std=c++11 -pthread test_client.cpp -o test_client
+```
+
+## Command Reference
+
+### String Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| GET | `GET <key>` | String value or nil |
+| SET | `SET <key> <value>` | nil |
+| DEL | `DEL <key>` | 1 if deleted, 0 if not found |
+| EXISTS | `EXISTS <key>` | 1 or 0 |
+| INCR | `INCR <key>` | New integer value (auto-creates with 1) |
+| DECR | `DECR <key>` | New integer value (auto-creates with -1) |
+| TYPE | `TYPE <key>` | "string", "list", "hash", "zset", or "none" |
+| KEYS | `KEYS` | Array of all key names |
+
+### List Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| LPUSH | `LPUSH <key> <value>` | New list length |
+| RPUSH | `RPUSH <key> <value>` | New list length |
+| LPOP | `LPOP <key>` | First element or nil |
+| RPOP | `RPOP <key>` | Last element or nil |
+| LLEN | `LLEN <key>` | List length (0 if not found) |
+| LRANGE | `LRANGE <key> <start> <stop>` | Array of elements (supports negative indices) |
+
+### Hash Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| HSET | `HSET <key> <field> <value>` | 1 if new field, 0 if updated |
+| HGET | `HGET <key> <field>` | Field value or nil |
+| HDEL | `HDEL <key> <field>` | 1 if deleted, 0 if not found |
+| HEXISTS | `HEXISTS <key> <field>` | 1 or 0 |
+| HGETALL | `HGETALL <key>` | Array of [field1, val1, field2, val2, ...] |
+
+### Sorted Set Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| ZADD | `ZADD <key> <score> <member>` | 1 if new, 0 if updated |
+| ZREM | `ZREM <key> <member>` | 1 if removed, 0 if not found |
+| ZSCORE | `ZSCORE <key> <member>` | Score (double) or nil |
+| ZQUERY | `ZQUERY <key> <score> <name> <offset> <limit>` | Flat array of [name1, score1, name2, score2, ...] |
+
+### TTL Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| PEXPIRE | `PEXPIRE <key> <ttl_ms>` | 1 if set, 0 if key not found |
+| PTTL | `PTTL <key>` | Remaining ms, -1 if no TTL, -2 if key not found |
+
+### Server Commands
+| Command | Syntax | Returns |
+|---------|--------|---------|
+| PING | `PING` | "PONG" |
+| ECHO | `ECHO <message>` | The message |
+| INFO | `INFO` | Server statistics |
+| FLUSHDB | `FLUSHDB` | "OK" (deletes all keys) |
+
+## Binary Protocol
+
+### Request Format
+```
+[4-byte total_length][4-byte nstr][4-byte len1][str1]...[4-byte lenN][strN]
+```
+All integers are little-endian.
+
+### Response Format
+```
+[4-byte length][1-byte tag][payload...]
+```
+
+| Tag | Value | Payload |
+|-----|-------|---------|
+| NIL | 0 | (none) |
+| ERR | 1 | [4-byte code][4-byte msg_len][msg] |
+| STR | 2 | [4-byte len][data] |
+| INT | 3 | [8-byte int64] |
+| DBL | 4 | [8-byte double] |
+| ARR | 5 | [4-byte count][items...] |
+
+### Error Codes
+| Code | Name | Description |
+|------|------|-------------|
+| 1 | ERR_UNKNOWN | Unknown command |
+| 2 | ERR_TOO_BIG | Response exceeds max size |
+| 3 | ERR_BAD_TYP | Wrong value type for operation |
+| 4 | ERR_BAD_ARG | Invalid argument |
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│                  Event Loop                      │
+│  poll() → accept/read/write → process_timers()   │
+├─────────────────────────────────────────────────┤
+│  Command Parser    │  Response Serializer        │
+│  (binary protocol) │  (tagged types)             │
+├─────────────────────────────────────────────────┤
+│              In-Memory Database                  │
+│  ┌──────────┐  ┌──────┐  ┌───────┐  ┌────────┐ │
+│  │  String  │  │ List │  │ Hash  │  │ ZSet   │ │
+│  │  (str)   │  │(deque)│  │ (HMap)│  │(AVL+HM)│ │
+│  └──────────┘  └──────┘  └───────┘  └────────┘ │
+│         All indexed by top-level HMap            │
+├─────────────────────────────────────────────────┤
+│  TTL Heap    │  Idle List   │  Thread Pool       │
+│  (expiry)    │  (timeouts)  │  (async del)       │
+├─────────────────────────────────────────────────┤
+│              AOF Persistence                     │
+│  Write commands → server.aof → replay on boot    │
+└─────────────────────────────────────────────────┘
 ```
 
 ## Project Structure
 
 ```
 redis_server/
-├── README.md                    # This file
-├── redis /                      # Main source code directory
-│   ├── 14_server.cpp            # Main server implementation
-│   ├── test_client.cpp          # Comprehensive test client
-│   ├── Makefile                 # Build system
-│   ├── common.h                 # Hash functions and container_of macro
-│   ├── avl.cpp / avl.h          # AVL tree implementation
-│   ├── hashtable.cpp / hashtable.h # Hash table with progressive rehashing
+├── README.md
+├── redis /                      # Source directory
+│   ├── 14_server.cpp            # Server: event loop, commands, persistence
+│   ├── test_client.cpp          # 82-test comprehensive test suite
+│   ├── Makefile                 # Build system (make, make test, make clean)
+│   ├── common.h                 # FNV hash, container_of macro
+│   ├── avl.cpp / avl.h          # AVL tree (insert, delete, rank queries)
+│   ├── hashtable.cpp / hashtable.h # Progressive-rehashing hash table
 │   ├── zset.cpp / zset.h        # Sorted set (AVL tree + hash table)
-│   ├── heap.cpp / heap.h        # Min-heap for TTL management
+│   ├── heap.cpp / heap.h        # Min-heap (TTL expiration)
 │   ├── list.h                   # Intrusive doubly-linked list
-│   └── thread_pool.cpp / thread_pool.h # Thread pool for async deletions
-├── basics_compNetwork.txt       # Notes on computer networking basics
-├── server.txt                   # Server and networking concepts
-├── socket_notes.txt             # Socket programming notes
-└── tech.txt                     # Technology overview and computer engineering concepts
+│   └── thread_pool.cpp / thread_pool.h # Thread pool for async operations
+├── basics_compNetwork.txt
+├── server.txt
+├── socket_notes.txt
+└── tech.txt
 ```
+
+## Test Coverage (82 tests)
+
+- **Basic commands** (3): PING, ECHO, ECHO empty
+- **Key-Value** (14): SET/GET, DEL, EXISTS, TYPE (all 4 types), KEYS
+- **Numeric** (6): INCR, DECR, edge cases, type errors
+- **TTL** (6): PEXPIRE, PTTL, automatic expiration
+- **Sorted Sets** (14): ZADD, ZSCORE, ZREM, ZQUERY (pagination/offset/limit), errors
+- **Lists** (14): LPUSH, RPUSH, LPOP, RPOP, LLEN, LRANGE (range/negative), errors
+- **Hashes** (15): HSET, HGET, HDEL, HGETALL, HEXISTS, errors
+- **Database** (3): FLUSHDB, key clearing
+- **Server** (1): INFO statistics
+- **Error handling** (2): Unknown commands, argument validation
+- **Advanced** (4): Large values (10KB), binary data, empty keys/values
 
 ## Notes
 
-- This is a learning implementation, not a production-ready Redis clone
-- The server uses a simple custom binary protocol, not the official Redis protocol (RESP)
-- Connection idle timeout is set to 5 seconds
-- The server supports up to 200,000 arguments per request (safety limit)
-- Large data structures (>1000 members) are deleted asynchronously using the thread pool
-- The `container_of` macro uses `__typeof__` for GCC/Clang portability
-
-## Future Improvements
-
-- More Redis commands (MGET/MSET, LPUSH/RPUSH/LPOP/RPOP, HSET/HGET, SADD/SMEMBERS)
-- Persistence (RDB/AOF)
-- Clustering and replication support
-- Official Redis protocol (RESP) compatibility
-- Configuration file support
-- Better error handling and logging
-- Lua scripting
+- The server uses a custom binary protocol, not Redis RESP
+- Connection idle timeout: 5 seconds
+- Max arguments per request: 200,000
+- Large data structures (>1000 members) are deleted asynchronously
+- `container_of` macro uses `__typeof__` for GCC/Clang portability
+- AOF log is replayed on startup for crash recovery

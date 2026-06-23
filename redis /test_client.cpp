@@ -336,6 +336,14 @@ static void test_type(int fd) {
     cmd_send(fd, {"zadd", "type_zset", "1.0", "member1"});
     if (cmd_expect_str(fd, {"type", "type_zset"}, "zset")) PASS(); else FAIL("");
 
+    TEST("TYPE for list key");
+    cmd_send(fd, {"lpush", "type_list", "item"});
+    if (cmd_expect_str(fd, {"type", "type_list"}, "list")) PASS(); else FAIL("");
+
+    TEST("TYPE for hash key");
+    cmd_send(fd, {"hset", "type_hash", "f", "v"});
+    if (cmd_expect_str(fd, {"type", "type_hash"}, "hash")) PASS(); else FAIL("");
+
     TEST("TYPE for non-existent key returns 'none'");
     if (cmd_expect_str(fd, {"type", "no_such_key"}, "none")) PASS(); else FAIL("");
 }
@@ -539,6 +547,173 @@ static void test_zset(int fd) {
     else FAIL("");
 }
 
+static void test_list(int fd) {
+    TEST("LPUSH creates list and returns length");
+    if (cmd_expect_int(fd, {"lpush", "mylist", "world"}, 1)) PASS(); else FAIL("");
+
+    TEST("LPUSH prepends and returns new length");
+    if (cmd_expect_int(fd, {"lpush", "mylist", "hello"}, 2)) PASS(); else FAIL("");
+
+    TEST("RPUSH appends and returns new length");
+    if (cmd_expect_int(fd, {"rpush", "mylist", "!"}, 3)) PASS(); else FAIL("");
+
+    TEST("LRANGE returns correct elements");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"lrange", "mylist", "0", "-1"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() == 3 &&
+            r.arr[0].tag == TAG_STR && r.arr[0].str_val == "hello" &&
+            r.arr[1].tag == TAG_STR && r.arr[1].str_val == "world" &&
+            r.arr[2].tag == TAG_STR && r.arr[2].str_val == "!") PASS();
+        else FAIL("size=%zu", r.arr.size());
+    }
+
+    TEST("LRANGE with range subset");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"lrange", "mylist", "1", "1"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() == 1 &&
+            r.arr[0].str_val == "world") PASS();
+        else FAIL("size=%zu", r.arr.size());
+    }
+
+    TEST("LRANGE with negative indices");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"lrange", "mylist", "-2", "-1"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() == 2 &&
+            r.arr[0].str_val == "world" && r.arr[1].str_val == "!") PASS();
+        else FAIL("size=%zu", r.arr.size());
+    }
+
+    TEST("LLEN returns correct length");
+    if (cmd_expect_int(fd, {"llen", "mylist"}, 3)) PASS(); else FAIL("");
+
+    TEST("LLEN on non-existent key returns 0");
+    if (cmd_expect_int(fd, {"llen", "nolist"}, 0)) PASS(); else FAIL("");
+
+    TEST("LPOP removes and returns first element");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"lpop", "mylist"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_STR && r.str_val == "hello") PASS();
+        else FAIL("tag=%d val=%s", r.tag, r.str_val.c_str());
+    }
+
+    TEST("RPOP removes and returns last element");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"rpop", "mylist"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_STR && r.str_val == "!") PASS();
+        else FAIL("tag=%d val=%s", r.tag, r.str_val.c_str());
+    }
+
+    TEST("LPOP on non-existent key returns nil");
+    if (cmd_expect_nil(fd, {"lpop", "nolist"})) PASS(); else FAIL("");
+
+    TEST("RPOP on non-existent key returns nil");
+    if (cmd_expect_nil(fd, {"rpop", "nolist"})) PASS(); else FAIL("");
+
+    TEST("List type mismatch returns error");
+    cmd_send(fd, {"set", "strkey", "val"});
+    if (cmd_expect_err(fd, {"lpush", "strkey", "x"}, ERR_BAD_TYP)) PASS(); else FAIL("");
+
+    TEST("LRANGE on non-existent key returns empty array");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"lrange", "nolist", "0", "-1"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() == 0) PASS();
+        else FAIL("size=%zu", r.arr.size());
+    }
+}
+
+static void test_hash(int fd) {
+    TEST("HSET new field returns 1");
+    if (cmd_expect_int(fd, {"hset", "myhash", "field1", "val1"}, 1)) PASS(); else FAIL("");
+
+    TEST("HSET existing field returns 0");
+    if (cmd_expect_int(fd, {"hset", "myhash", "field1", "val2"}, 0)) PASS(); else FAIL("");
+
+    TEST("HGET returns correct value");
+    if (cmd_expect_str(fd, {"hget", "myhash", "field1"}, "val2")) PASS(); else FAIL("");
+
+    TEST("HGET non-existent field returns nil");
+    if (cmd_expect_nil(fd, {"hget", "myhash", "nofield"})) PASS(); else FAIL("");
+
+    TEST("HGET non-existent hash returns nil");
+    if (cmd_expect_nil(fd, {"hget", "nohash", "field1"})) PASS(); else FAIL("");
+
+    TEST("HEXISTS for existing field returns 1");
+    if (cmd_expect_int(fd, {"hexists", "myhash", "field1"}, 1)) PASS(); else FAIL("");
+
+    TEST("HEXISTS for non-existing field returns 0");
+    if (cmd_expect_int(fd, {"hexists", "myhash", "nofield"}, 0)) PASS(); else FAIL("");
+
+    TEST("HEXISTS for non-existing hash returns 0");
+    if (cmd_expect_int(fd, {"hexists", "nohash", "field1"}, 0)) PASS(); else FAIL("");
+
+    TEST("Multiple HSET fields");
+    cmd_send(fd, {"hset", "myhash", "field2", "v2"});
+    cmd_send(fd, {"hset", "myhash", "field3", "v3"});
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"hget", "myhash", "field2"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_STR && r.str_val == "v2") PASS();
+        else FAIL("tag=%d", r.tag);
+    }
+
+    TEST("HGETALL returns all field-value pairs");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"hgetall", "myhash"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() >= 6) {  // 3 fields * 2 = 6 elements
+            // Verify key-value pairs are interleaved
+            int found = 0;
+            for (size_t i = 0; i + 1 < r.arr.size(); i += 2) {
+                if (r.arr[i].tag == TAG_STR && r.arr[i+1].tag == TAG_STR) {
+                    if (r.arr[i].str_val == "field1" && r.arr[i+1].str_val == "val2") found++;
+                    if (r.arr[i].str_val == "field2" && r.arr[i+1].str_val == "v2") found++;
+                    if (r.arr[i].str_val == "field3" && r.arr[i+1].str_val == "v3") found++;
+                }
+            }
+            if (found == 3) PASS(); else FAIL("found %d/3 pairs", found);
+        } else {
+            FAIL("tag=%d size=%zu", r.tag, r.arr.size());
+        }
+    }
+
+    TEST("HGETALL on non-existent hash returns empty array");
+    {
+        ParsedResponse r;
+        if (!cmd_ok(fd, {"hgetall", "nohash"}, r)) { FAIL("send/recv"); return; }
+        if (r.tag == TAG_ARR && r.arr.size() == 0) PASS();
+        else FAIL("size=%zu", r.arr.size());
+    }
+
+    TEST("HDEL existing field returns 1");
+    if (cmd_expect_int(fd, {"hdel", "myhash", "field3"}, 1)) PASS(); else FAIL("");
+
+    TEST("HDEL non-existing field returns 0");
+    if (cmd_expect_int(fd, {"hdel", "myhash", "field3"}, 0)) PASS(); else FAIL("");
+
+    TEST("HDEL on non-existing hash returns 0");
+    if (cmd_expect_int(fd, {"hdel", "nohash", "x"}, 0)) PASS(); else FAIL("");
+
+    TEST("Hash type mismatch returns error");
+    cmd_send(fd, {"set", "strkey2", "val"});
+    if (cmd_expect_err(fd, {"hset", "strkey2", "f", "v"}, ERR_BAD_TYP)) PASS(); else FAIL("");
+}
+
+static void test_info(int fd) {
+    TEST("INFO returns server statistics");
+    ParsedResponse r;
+    if (!cmd_ok(fd, {"info"}, r)) { FAIL("send/recv"); return; }
+    if (r.tag == TAG_STR && r.str_val.find("uptime_ms:") != std::string::npos &&
+        r.str_val.find("requests_processed:") != std::string::npos &&
+        r.str_val.find("total_keys:") != std::string::npos) PASS();
+    else FAIL("tag=%d missing expected fields", r.tag);
+}
+
 static void test_flushdb(int fd) {
     TEST("FLUSHDB returns OK");
     cmd_send(fd, {"set", "flush1", "val1"});
@@ -647,6 +822,15 @@ int main(int argc, char **argv) {
 
     fprintf(stderr, "\n─── Sorted Set operations ────────────────────────────\n");
     test_zset(fd);
+
+    fprintf(stderr, "\n─── List operations ──────────────────────────────────\n");
+    test_list(fd);
+
+    fprintf(stderr, "\n─── Hash operations ──────────────────────────────────\n");
+    test_hash(fd);
+
+    fprintf(stderr, "\n─── Server info ──────────────────────────────────────\n");
+    test_info(fd);
 
     fprintf(stderr, "\n─── Database operations ──────────────────────────────\n");
     test_flushdb(fd);

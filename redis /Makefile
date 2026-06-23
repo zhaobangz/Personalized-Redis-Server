@@ -34,4 +34,4 @@ test: $(TARGET) $(TEST_BIN)
 build: $(TARGET)
 
 clean:
-	rm -f $(TARGET) $(TEST_BIN) $(OBJS)
+	rm -f $(TARGET) $(TEST_BIN) $(OBJS) server.aof

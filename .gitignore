@@ -1,0 +1,11 @@
+# Build artifacts
+redis /server
+redis /test_client
+*.o
+
+# Persistence
+redis /server.aof
+
+# macOS
+.DS_Store
+._*
